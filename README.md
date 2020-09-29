@@ -41,3 +41,11 @@ cd JointTG/bin
 ./JointTG ./bricks/images ./bricks/bricks-fusion.ply ./bricks/traj.log
 ```
 We need to modify the configuration file ```config.yml``` before running the other datasets.
+
+## 2. Dependencies
+The code has following prerequisites:
+- ubuntu 16.04
+- gcc (5.4.0)
+- OpenCV (2.4.10)
+- Eigen (>3.0)
+
