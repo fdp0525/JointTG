@@ -99,7 +99,7 @@ int main(int argc, char** argv)
     option.non_rigid_camera_coordinate_ = false;
     open3d::color_map::ColorMapOptimization(mesh, rgbdimages, trajectory, option);
 
-    open3d::io::WriteTriangleMesh("nooption.ply",mesh);//without any optimization
+    open3d::io::WriteTriangleMesh("withoutoption.ply",mesh);//without any optimization
 
 
     open3d::color_map::ColorAndMeshOptimization(mesh, rgbdimages, trajectory);//joint opetimizaiton
