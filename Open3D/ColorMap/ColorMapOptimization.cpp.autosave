@@ -1,0 +1,2129 @@
+// ----------------------------------------------------------------------------
+// -                        Open3D: www.open3d.org                            -
+// ----------------------------------------------------------------------------
+// The MIT License (MIT)
+//
+// Copyright (c) 2018 www.open3d.org
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+// IN THE SOFTWARE.
+// ----------------------------------------------------------------------------
+
+#include "ColorMapOptimization.h"
+#include <Eigen/Dense>
+#include "colorOptimizetionFuctor.h"
+
+#include <Open3D/Camera/PinholeCameraTrajectory.h>
+#include <Open3D/ColorMap/ColorMapOptimizationJacobian.h>
+#include <Open3D/ColorMap/ImageWarpingField.h>
+#include <Open3D/ColorMap/TriangleMeshAndImageUtilities.h>
+#include <Open3D/Geometry/Image.h>
+#include <Open3D/Geometry/RGBDImage.h>
+#include <Open3D/Geometry/TriangleMesh.h>
+#include <Open3D/Utility/Console.h>
+#include <Open3D/Utility/Eigen.h>
+#include <Open3D/IO/ClassIO/ImageWarpingFieldIO.h>
+#include <Open3D/IO/ClassIO/PinholeCameraTrajectoryIO.h>
+#include <iostream>
+//#include "reg_cost.h"
+//#include "reg_cost2.h"
+#include <iostream>
+#include "jointtgconfig.h"
+
+namespace open3d {
+
+namespace {
+
+using namespace color_map;
+void OptimizeImageCoorNonrigid(
+        const geometry::TriangleMesh& mesh,
+        const std::vector<std::shared_ptr<geometry::Image>>& images_gray,
+        const std::vector<std::shared_ptr<geometry::Image>>& images_dx,
+        const std::vector<std::shared_ptr<geometry::Image>>& images_dy,
+        std::vector<ImageWarpingField>& warping_fields,
+        const std::vector<ImageWarpingField>& warping_fields_init,
+        camera::PinholeCameraTrajectory& camera,
+        const std::vector<std::vector<int>>& visiblity_vertex_to_image,
+        const std::vector<std::vector<int>>& visiblity_image_to_vertex,
+        std::vector<double>& proxy_intensity,
+        const ColorMapOptimizationOption& option)
+{
+    auto n_vertex = mesh.vertices_.size();
+    auto n_camera = camera.parameters_.size();
+    SetProxyIntensityForVertex(mesh, images_gray, warping_fields, camera,
+                               visiblity_vertex_to_image, proxy_intensity,
+                               option.image_boundary_margin_);
+    for (int itr = 0; itr < option.maximum_iteration_; itr++)
+    {
+        //        utility::PrintDebug("[Iteration %04d] ", itr + 1);
+        std::cout<<"Iteration:"<<itr<<std::endl;
+        double residual = 0.0;
+        double residual_reg = 0.0;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+        for (int c = 0; c < n_camera; c++) {
+            int nonrigidval = warping_fields[c].anchor_w_ *
+                    warping_fields[c].anchor_h_ * 2;
+            double rr_reg = 0.0;
+            
+            Eigen::Matrix4d pose;
+            pose = camera.parameters_[c].extrinsic_;
+            
+            auto intrinsic = camera.parameters_[c].intrinsic_.intrinsic_matrix_;
+            auto extrinsic = camera.parameters_[c].extrinsic_;
+            ColorMapOptimizationJacobian jac;
+            Eigen::Matrix4d intr = Eigen::Matrix4d::Zero();
+            intr.block<3, 3>(0, 0) = intrinsic;
+            intr(3, 3) = 1.0;
+            
+            auto f_lambda = [&](int i, Eigen::Vector14d& J_r, double& r,
+                    Eigen::Vector14i& pattern) {
+                jac.ComputeJacobianAndResidualNonRigid(
+                            i, J_r, r, pattern, mesh, proxy_intensity,
+                            images_gray[c], images_dx[c], images_dy[c],
+                            warping_fields[c], warping_fields_init[c], intr,
+                            extrinsic, visiblity_image_to_vertex[c],
+                            option.image_boundary_margin_);
+            };
+            Eigen::MatrixXd JTJ;
+            Eigen::VectorXd JTr;
+            double r2;
+            std::tie(JTJ, JTr, r2) =
+                    ComputeJTJandJTrNonRigid<Eigen::Vector14d, Eigen::Vector14i,
+                    Eigen::MatrixXd, Eigen::VectorXd>(
+                        f_lambda, visiblity_image_to_vertex[c].size(),
+                        nonrigidval, false);
+            
+            double weight = option.non_rigid_anchor_point_weight_ *
+                    visiblity_image_to_vertex[c].size() / n_vertex;
+            for (int j = 0; j < nonrigidval; j++) {
+                double r = weight * (warping_fields[c].flow_(j) -
+                                     warping_fields_init[c].flow_(j));
+                JTJ(6 + j, 6 + j) += weight * weight;
+                JTr(6 + j) += weight * r;
+                rr_reg += r * r;
+            }
+            
+            bool success;
+            Eigen::VectorXd result;
+            std::tie(success, result) = utility::SolveLinearSystemPSD(
+                        JTJ, -JTr, /*prefer_sparse=*/false,
+                        /*check_symmetric=*/false,
+                        /*check_det=*/false, /*check_psd=*/false);
+            Eigen::Vector6d result_pose;
+            result_pose << result.block(0, 0, 6, 1);
+            auto delta = utility::TransformVector6dToMatrix4d(result_pose);
+            pose = delta * pose;
+            
+            for (int j = 0; j < nonrigidval; j++) {
+                warping_fields[c].flow_(j) += result(6 + j);
+            }
+            camera.parameters_[c].extrinsic_ = pose;
+            
+#ifdef _OPENMP
+#pragma omp critical
+#endif
+            {
+                residual += r2;
+                residual_reg += rr_reg;
+            }
+        }
+        //        utility::PrintDebug("Residual error : %.6f, reg : %.6f\n", residual,
+        //                            residual_reg);
+        std::cout<<"Residual error :"<<residual<<" reg:"<<residual_reg<<std::endl;
+        
+        SetProxyIntensityForVertex(mesh, images_gray, warping_fields, camera,
+                                   visiblity_vertex_to_image, proxy_intensity,
+                                   option.image_boundary_margin_);
+    }
+}
+
+void OptimizeImageCoorRigid(
+        const geometry::TriangleMesh& mesh,
+        const std::vector<std::shared_ptr<geometry::Image>>& images_gray,
+        const std::vector<std::shared_ptr<geometry::Image>>& images_dx,
+        const std::vector<std::shared_ptr<geometry::Image>>& images_dy,
+        camera::PinholeCameraTrajectory& camera,
+        const std::vector<std::vector<int>>& visiblity_vertex_to_image,
+        const std::vector<std::vector<int>>& visiblity_image_to_vertex,
+        std::vector<double>& proxy_intensity,
+        const ColorMapOptimizationOption& option)
+{
+    int total_num_ = 0;
+    auto n_camera = camera.parameters_.size();
+//    SetProxyIntensityForVertex(mesh, images_gray, camera,
+//                               visiblity_vertex_to_image, proxy_intensity,
+//                               option.image_boundary_margin_);
+    for (int itr = 0; itr < option.maximum_iteration_; itr++)
+    {
+        //        utility::PrintDebug("[Iteration %04d] ", itr + 1);
+        std::cout<<"Iteration:"<<itr+1<<std::endl;
+        double residual = 0.0;
+        total_num_ = 0;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+        for (int c = 0; c < n_camera; c++) {
+            Eigen::Matrix4d pose;
+            pose = camera.parameters_[c].extrinsic_;
+            
+//            auto intrinsic = camera.parameters_[c].intrinsic_.intrinsic_matrix_;
+            auto depthintrinsic = camera.parameters_[c].depthintrinsic_.intrinsic_matrix_;
+            auto colorintrinsic = camera.parameters_[c].colorintrinsic_.intrinsic_matrix_;
+
+            auto extrinsic = camera.parameters_[c].extrinsic_;
+            ColorMapOptimizationJacobian jac;
+            Eigen::Matrix4d depthintr = Eigen::Matrix4d::Zero();
+            depthintr.block<3, 3>(0, 0) = depthintrinsic;
+            depthintr(3, 3) = 1.0;
+
+            Eigen::Matrix4d colorintr = Eigen::Matrix4d::Zero();
+            colorintr.block<3, 3>(0, 0) = colorintrinsic;
+            colorintr(3, 3) = 1.0;
+            
+            auto f_lambda = [&](int i, Eigen::Vector6d& J_r, double& r)
+            {
+                jac.ComputeJacobianAndResidualRigid(
+                            i, J_r, r, mesh, proxy_intensity, images_gray[c],
+                            images_dx[c], images_dy[c], colorintr, extrinsic,
+                            visiblity_image_to_vertex[c],
+                            option.image_boundary_margin_);
+            };
+            Eigen::Matrix6d JTJ;
+            Eigen::Vector6d JTr;
+            double r2;
+            std::tie(JTJ, JTr, r2) =
+                    utility::ComputeJTJandJTr<Eigen::Matrix6d, Eigen::Vector6d>(
+                        f_lambda, visiblity_image_to_vertex[c].size(),
+                        false);
+            
+            bool is_success;
+            Eigen::Matrix4d delta;
+            std::tie(is_success, delta) =
+                    utility::SolveJacobianSystemAndObtainExtrinsicMatrix(JTJ,
+                                                                         JTr);
+            pose = delta * pose;
+            camera.parameters_[c].extrinsic_ = pose;
+#ifdef _OPENMP
+#pragma omp critical
+#endif
+            {
+                residual += r2;
+                total_num_ += visiblity_image_to_vertex[c].size();
+            }
+        }
+        utility::PrintDebug("Residual error : %.6f (avg : %.6f)\n", residual,
+                            residual / total_num_);
+        std::cout<<"Residual error :"<<residual<<" avg:"<<residual / total_num_<<std::endl;
+        SetProxyIntensityForVertex(mesh, images_gray, camera,
+                                   visiblity_vertex_to_image, proxy_intensity,
+                                   option.image_boundary_margin_);
+    }
+}
+
+std::tuple<std::vector<std::shared_ptr<geometry::Image>>,
+std::vector<std::shared_ptr<geometry::Image>>,
+std::vector<std::shared_ptr<geometry::Image>>,
+std::vector<std::shared_ptr<geometry::Image>>,
+std::vector<std::shared_ptr<geometry::Image>>>
+CreateGradientImages(
+        const std::vector<std::shared_ptr<geometry::RGBDImage>>& images_rgbd)
+{
+    std::vector<std::shared_ptr<geometry::Image>> images_gray;
+    std::vector<std::shared_ptr<geometry::Image>> images_dx;
+    std::vector<std::shared_ptr<geometry::Image>> images_dy;
+    std::vector<std::shared_ptr<geometry::Image>> images_color;
+    std::vector<std::shared_ptr<geometry::Image>> images_depth;
+    for (auto i = 0; i < images_rgbd.size(); i++)
+    {
+        auto gray_image = CreateFloatImageFromImage(images_rgbd[i]->color_);
+        auto gray_image_filtered = geometry::FilterImage(
+                    *gray_image, geometry::Image::FilterType::Gaussian3);
+        images_gray.push_back(gray_image_filtered);
+        images_dx.push_back(geometry::FilterImage(
+                                *gray_image_filtered, geometry::Image::FilterType::Sobel3Dx));
+        images_dy.push_back(geometry::FilterImage(
+                                *gray_image_filtered, geometry::Image::FilterType::Sobel3Dy));
+        auto color = std::make_shared<geometry::Image>(images_rgbd[i]->color_);
+        auto depth = std::make_shared<geometry::Image>(images_rgbd[i]->depth_);
+        images_color.push_back(color);
+        images_depth.push_back(depth);
+    }
+    
+    return std::move(std::make_tuple(images_gray, images_dx, images_dy,
+                                     images_color, images_depth));
+}
+
+std::vector<std::shared_ptr<geometry::Image>> CreateDepthBoundaryMasks(
+        const std::vector<std::shared_ptr<geometry::Image>>& images_depth,
+        const ColorMapOptimizationOption& option) {
+    auto n_images = images_depth.size();
+    std::vector<std::shared_ptr<geometry::Image>> masks;
+    for (auto i = 0; i < n_images; i++) {
+        utility::PrintDebug("[MakeDepthMasks] geometry::Image %d/%d\n", i,
+                            n_images);
+        masks.push_back(geometry::CreateDepthBoundaryMask(
+                            *images_depth[i],
+                            option.depth_threshold_for_discontinuity_check_,
+                            option.half_dilation_kernel_size_for_discontinuity_map_));
+    }
+    return masks;
+}
+
+std::vector<ImageWarpingField> CreateWarpingFields(
+        const std::vector<std::shared_ptr<geometry::Image>>& images,
+        const ColorMapOptimizationOption& option) {
+    std::vector<ImageWarpingField> fields;
+    for (auto i = 0; i < images.size(); i++) {
+        int width = images[i]->width_;
+        int height = images[i]->height_;
+        fields.push_back(ImageWarpingField(width, height,
+                                           option.number_of_vertical_anchors_));
+    }
+    return std::move(fields);
+}
+
+}  // unnamed namespace
+
+namespace color_map {
+void ColorMapOptimization(
+        geometry::TriangleMesh& mesh,
+        const std::vector<std::shared_ptr<geometry::RGBDImage>>& images_rgbd,
+        camera::PinholeCameraTrajectory& camera,
+        const ColorMapOptimizationOption& option
+        /* = ColorMapOptimizationOption()*/) {
+    utility::PrintDebug("[ColorMapOptimization]\n");
+    std::vector<std::shared_ptr<geometry::Image>> images_gray, images_dx,
+            images_dy, images_color, images_depth;
+    std::tie(images_gray, images_dx, images_dy, images_color, images_depth) =
+            CreateGradientImages(images_rgbd);
+    
+    //    utility::PrintDebug("[ColorMapOptimization] :: MakingMasks\n");
+    std::cout<<"[ColorMapOptimization] :: MakingMasks"<<std::endl;
+    auto images_mask = CreateDepthBoundaryMasks(images_depth, option);
+    
+    //    utility::PrintDebug("[ColorMapOptimization] :: VisibilityCheck\n");
+    std::cout<<"[ColorMapOptimization] :: VisibilityCheck"<<std::endl;;
+    
+    std::vector<std::vector<int>> visiblity_vertex_to_image;
+    std::vector<std::vector<int>> visiblity_image_to_vertex;
+    std::tie(visiblity_vertex_to_image, visiblity_image_to_vertex) =
+            CreateVertexAndImageVisibility(
+                mesh, images_depth, images_mask, camera,
+                option.maximum_allowable_depth_,
+                option.depth_threshold_for_visiblity_check_);
+    
+    std::vector<double> proxy_intensity;
+    if (option.non_rigid_camera_coordinate_)
+    {
+        //        utility::PrintDebug(
+        //                "[ColorMapOptimization] :: Non-Rigid Optimization\n");
+        std::cout<<"[ColorMapOptimization] :: Non-Rigid Optimization"<<std::endl;
+        auto warping_uv_ = CreateWarpingFields(images_gray, option);
+        auto warping_uv_init_ = CreateWarpingFields(images_gray, option);
+        OptimizeImageCoorNonrigid(
+                    mesh, images_gray, images_dx, images_dy, warping_uv_,
+                    warping_uv_init_, camera, visiblity_vertex_to_image,
+                    visiblity_image_to_vertex, proxy_intensity, option);
+        SetGeometryColorAverage(mesh, images_color, warping_uv_, camera,
+                                visiblity_vertex_to_image,
+                                option.image_boundary_margin_);
+    } else {
+        //        utility::PrintDebug("[ColorMapOptimization] :: Rigid Optimization\n");
+        std::cout<<"[ColorMapOptimization] :: Rigid Optimization"<<std::endl;
+        OptimizeImageCoorRigid(mesh, images_gray, images_dx, images_dy, camera,
+                               visiblity_vertex_to_image,
+                               visiblity_image_to_vertex, proxy_intensity,
+                               option);
+        SetGeometryColorAverage(mesh, images_color, camera,
+                                visiblity_vertex_to_image,
+                                option.image_boundary_margin_);
+    }
+}
+
+void compute1Rnear(const geometry::TriangleMesh &mesh, std::vector<std::vector<int> > &pts_near_r)
+{
+    pts_near_r.resize(mesh.vertices_.size());
+    
+    for(int i = 0; i < mesh.vertices_.size(); i++)
+    {
+        std::unordered_set<int> adjlist = mesh.adjacency_list_[i];
+        for(std::unordered_set<int>::iterator iter = adjlist.begin(); iter != adjlist.end(); iter++)
+        {
+            pts_near_r[i].push_back(*iter);
+        }
+    }
+}
+
+void compute1RFaces(const geometry::TriangleMesh &mesh, std::vector<std::vector<int> > &adj_1r_faces)
+{
+    adj_1r_faces.clear();
+    adj_1r_faces.resize(mesh.vertices_.size());
+
+    for(int i = 0; i<mesh.vertices_.size(); i++)
+    {
+        std::unordered_set<int>  a_faces = mesh.adjfaces[i];
+        for(std::unordered_set<int>::iterator iter = a_faces.begin(); iter != a_faces.end(); iter++)
+        {
+            adj_1r_faces[i].push_back(*iter);
+        }
+    }
+}
+
+void compute2RFaces(const geometry::TriangleMesh &mesh, std::vector<std::vector<int> > &adj_2r_faces)
+{
+    adj_2r_faces.clear();
+    adj_2r_faces.resize(mesh.vertices_.size());
+
+    for(int i = 0; i<mesh.vertices_.size(); i++)
+    {
+        std::unordered_set<int>  vers;
+        std::unordered_set<int>  a_faces = mesh.adjfaces[i];
+        for(std::unordered_set<int>::iterator iter = a_faces.begin(); iter != a_faces.end(); iter++)
+        {
+//            adj_2r_faces[i].push_back(*iter);
+            vers.insert(*iter);
+            Eigen::Vector3i  v_idx = mesh.triangles_[*iter];
+            for(int vid = 0; vid < 3; vid++)
+            {
+                std::unordered_set<int>  a_faces2 = mesh.adjfaces[v_idx(vid)];
+                for(std::unordered_set<int>::iterator iter2 = a_faces2.begin(); iter2 != a_faces2.end(); iter2++)
+                {
+//                    adj_2r_faces[i].push_back(*iter);
+                    vers.insert(*iter2);
+
+                }
+            }
+        }
+        for(std::unordered_set<int>::iterator iter2 = vers.begin(); iter2 != vers.end(); iter2++)
+        {
+            adj_2r_faces[i].push_back(*iter2);
+        }
+
+    }
+}
+
+void compute2_3Rnear(const geometry::TriangleMesh &mesh, std::vector<std::vector<int> > &pts_near_r)
+{
+    pts_near_r.resize(mesh.vertices_.size());
+    
+    for(int i = 0; i < mesh.vertices_.size(); i++)
+    {
+        std::unordered_set<int> R1list;
+        std::unordered_set<int> adjlist = mesh.adjacency_list_[i];
+        for(std::unordered_set<int>::iterator iter = adjlist.begin(); iter != adjlist.end(); iter++)
+        {
+            //            pts_near_r[i].push_back(*iter);
+            R1list.insert(*iter);
+            std::unordered_set<int> adjlist2 = mesh.adjacency_list_[*iter];
+            for(std::unordered_set<int>::iterator iter2 = adjlist2.begin(); iter2 != adjlist2.end(); iter2++)
+            {
+                R1list.insert(*iter2);
+                std::unordered_set<int> adjlist3 = mesh.adjacency_list_[*iter2];
+                for(std::unordered_set<int>::iterator iter3 = adjlist3.begin(); iter3 != adjlist3.end(); iter3++)
+                {
+                    //                    R1list.insert(*iter2);
+                }
+            }
+        }
+        
+        for(std::unordered_set<int>::iterator iter = R1list.begin(); iter != R1list.end(); iter++)
+        {
+            pts_near_r[i].push_back(*iter);
+        }
+    }
+    
+    //    std::unordered_set<int> adjlist = mesh.adjacency_list_[i];
+    
+}
+
+void initOffset(std::vector<Eigen::Vector3d >  &pt_offset, int num)
+{
+    pt_offset.resize(num);
+    for(int i=0;i<pt_offset.size();i++)
+    {
+        pt_offset[i](0)=0.f;
+        pt_offset[i](1)=0.f;
+        pt_offset[i](2)=0.f;
+    }
+}
+
+void updateMesh(geometry::TriangleMesh& mesh, std::vector<Eigen::Vector3d >  pt_offset)
+{
+    for(int i = 0; i < mesh.vertices_.size(); i++)
+    {
+        mesh.vertices_[i](0) += pt_offset[i](0);
+        mesh.vertices_[i](1) += pt_offset[i](1);
+        mesh.vertices_[i](2) += pt_offset[i](2);
+    }
+}
+
+void initmesh(std::vector<Eigen::Vector3d>  &tempmesh, geometry::TriangleMesh &mesh)
+{
+    //    pt_offset.resize(num);
+    for(int i=0;i < mesh.vertices_.size();i++)
+    {
+        //        pt_offset[i](0)=0.f;
+        //        pt_offset[i](1)=0.f;
+        //        pt_offset[i](2)=0.f;
+        Eigen::Vector3d  v = mesh.vertices_[i];
+        tempmesh.push_back(v);
+    }
+}
+
+void bilateralMeshDenoising(geometry::TriangleMesh& mesh, std::vector<std::vector<int> >  pts_1r_near)
+{
+    double abc = 0.2;
+    for(int i = 0; i < mesh.vertices_.size(); i++)
+    {
+        if(mesh.verticesInfo[i] != open3d::geometry::TriangleMesh::VERTEX_CLASS_SIMPLE)
+        {
+            continue;
+        }
+
+        std::vector<int>  adj_verts = pts_1r_near[i];
+        Eigen::Vector3d   v = mesh.vertices_[i];
+        Eigen::Vector3d   norm = mesh.vertex_normals_[i];
+        double sum = 0.0;
+        double normalizer = 0.0;
+        for(int n_i = 0; n_i < adj_verts.size(); n_i++)
+        {
+            Eigen::Vector3d  adj_v = mesh.vertices_[adj_verts[n_i]];
+            Eigen::Vector3d  dist_v = v - adj_v;
+            double t = std::sqrt(dist_v.dot(dist_v));
+            double h = norm.dot(dist_v);
+            double w_c = std::exp(-t*t)/(2*abc*abc);
+            double w_s = std::exp(-h*h/(2*abc*abc));
+            sum += (w_c*w_s)*h;
+            normalizer += w_c*w_s;
+        }
+        mesh.vertices_[i] = mesh.vertices_[i] + norm*(sum/normalizer);
+    }
+}
+
+void HCLaplacianSmooth(geometry::TriangleMesh& mesh, std::vector<std::vector<int> >  pts_1r_near)
+{
+    float factor1 = 0.4f;
+    float factor2 = 0.6f;
+    std::vector<Eigen::Vector3d >  tempmesh;
+    initmesh(tempmesh, mesh);
+    std::vector<Eigen::Vector3d >  laplacianmesh;
+    initOffset(laplacianmesh, mesh.vertices_.size());
+
+    for(int iter = 0; iter < 5; iter++)
+    {
+        for(int i = 0; i < mesh.vertices_.size(); i++)
+        {
+            if(mesh.verticesInfo[i] != open3d::geometry::TriangleMesh::VERTEX_CLASS_SIMPLE)
+            {
+                continue;
+            }
+
+            std::vector<int>  adj_verts = pts_1r_near[i];
+            Eigen::Vector3d  dv(0,0,0);
+            for(int n_i = 0; n_i < adj_verts.size(); n_i++)
+            {
+                Eigen::Vector3d nv = mesh.vertices_[adj_verts[n_i]];
+                dv += nv;
+            }
+            if(adj_verts.size() != 0)
+            {
+                dv = dv/adj_verts.size();
+            }
+
+            laplacianmesh[i] = dv - (factor1*tempmesh[i] + (1-factor1)*mesh.vertices_[i]);
+            tempmesh[i] = dv;
+        }
+
+        for(int i = 0; i < mesh.vertices_.size(); i++)
+        {
+            if(mesh.verticesInfo[i] != open3d::geometry::TriangleMesh::VERTEX_CLASS_SIMPLE)
+            {
+                continue;
+            }
+
+            std::vector<int>  adj_verts = pts_1r_near[i];
+            Eigen::Vector3d  dv(0,0,0);
+            for(int n_i = 0; n_i < adj_verts.size(); n_i++)
+            {
+                Eigen::Vector3d nv = laplacianmesh[adj_verts[n_i]];
+                dv += nv;
+            }
+
+            if(adj_verts.size() != 0)
+            {
+                dv = (1.0 - factor2)*dv/adj_verts.size();
+            }
+            else
+            {
+                dv.setZero();
+            }
+
+            mesh.vertices_[i] = tempmesh[i] - (factor2*laplacianmesh[i] +dv);
+        }
+    }
+}
+
+void OptimizeColorAndMesh(
+        geometry::TriangleMesh& mesh,
+        const std::vector<std::shared_ptr<geometry::Image>>& images_gray,
+        const std::vector<std::shared_ptr<geometry::Image>>& images_color,
+        const std::vector<std::shared_ptr<geometry::Image>>& images_dx,
+        const std::vector<std::shared_ptr<geometry::Image>>& images_dy,
+        camera::PinholeCameraTrajectory& camera,
+        const std::vector<std::vector<int>>& visiblity_vertex_to_image,
+        const std::vector<std::vector<int>>& visiblity_image_to_vertex,
+        std::vector<double>& proxy_intensity,
+        const ColorMapOptimizationOption& option)
+{
+    
+    //网格优化预处理
+    std::vector<std::vector<int> >  pts_1r_near;//半径r相邻;
+    std::vector<std::vector<int> >  pts_2r_near;//半径r相邻;
+    
+    compute1Rnear(mesh, pts_1r_near);//取出每个顶点的1环邻接点
+    compute2_3Rnear(mesh, pts_2r_near);
+    Eigen::Matrix3d    intrinsic = camera.parameters_[0].intrinsic_.intrinsic_matrix_;
+    Eigen::Matrix4d    intr = Eigen::Matrix4d::Zero();
+    intr.block<3, 3>(0, 0) = intrinsic;
+    intr(3, 3) = 1.0;
+    
+    
+    //用于记录每次的偏移量;
+    std::vector<Eigen::Vector3d >  pt_offset;
+    std::vector<Eigen::Vector3d >  pt_offset_temp;
+    initOffset(pt_offset, mesh.vertices_.size());
+    
+    int total_num_ = 0;
+    auto n_camera = camera.parameters_.size();
+    
+    SetProxyIntensityForVertex(mesh, images_gray, camera,
+                               visiblity_vertex_to_image, proxy_intensity,
+                               option.image_boundary_margin_);
+    
+    for (int itr = 0; itr < option.maximum_iteration_; itr++)
+    {
+        std::cout<<"Iteration:"<<itr+1<<std::endl;
+        double residual = 0.0;
+        total_num_ = 0;
+        
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+        for(int c = 0; c < n_camera; c++)
+        {
+            Eigen::Matrix4d pose;
+            pose = camera.parameters_[c].extrinsic_;
+            auto intrinsic = camera.parameters_[c].intrinsic_.intrinsic_matrix_;
+            auto extrinsic = camera.parameters_[c].extrinsic_;
+            
+            ColorMapOptimizationJacobian jac;
+            Eigen::Matrix4d intr = Eigen::Matrix4d::Zero();
+            intr.block<3, 3>(0, 0) = intrinsic;
+            intr(3, 3) = 1.0;
+            
+            auto f_lambda = [&](int i, Eigen::Vector6d& J_r, double& r)
+            {
+                jac.ComputeJacobianAndResidualRigid(
+                            i, J_r, r, mesh, proxy_intensity, images_gray[c],
+                            images_dx[c], images_dy[c], intr, extrinsic,
+                            visiblity_image_to_vertex[c],
+                            option.image_boundary_margin_);
+            };
+            
+            Eigen::Matrix6d JTJ;
+            Eigen::Vector6d JTr;
+            double r2;
+            std::tie(JTJ, JTr, r2) =
+                    utility::ComputeJTJandJTr<Eigen::Matrix6d, Eigen::Vector6d>(
+                        f_lambda, visiblity_image_to_vertex[c].size(),
+                        false);
+            bool is_success;
+            Eigen::Matrix4d delta;
+            std::tie(is_success, delta) = utility::SolveJacobianSystemAndObtainExtrinsicMatrix(JTJ, JTr);
+            pose = delta * pose;
+            camera.parameters_[c].extrinsic_ = pose;
+#ifdef _OPENMP
+#pragma omp critical
+#endif
+            {
+                residual += r2;
+                total_num_ += visiblity_image_to_vertex[c].size();
+            }
+            
+        }
+        
+        std::cout<<"Residual error :"<<residual<<" avg:"<<residual / total_num_<<std::endl;
+        SetProxyIntensityForVertex(mesh, images_gray, camera,
+                                   visiblity_vertex_to_image, proxy_intensity,
+                                   option.image_boundary_margin_);
+
+        if(itr % 20 == 0)
+        {
+            SetGeometryColorAverage(mesh, images_color, camera,
+                                    visiblity_vertex_to_image,
+                                    option.image_boundary_margin_);
+            char buf[256];
+            sprintf(buf,"iter%02d_optimization.ply",itr);
+            open3d::io::WriteTriangleMesh(buf,mesh);
+        }
+
+
+        if(itr % 10 != 0)
+        {
+            continue;
+        }
+        std::cout<<"-----------geo itr:"<<itr<<std::endl;
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+        for(int pt_i = 0; pt_i < mesh.vertices_.size(); pt_i++)
+        {
+            if(visiblity_vertex_to_image[pt_i].size() < 2)
+            {
+                continue;
+            }
+            //            std::vector<std::vector<float> > JA;
+            //            std::vector<float> Jb;
+            Eigen::VectorXd x_M=Eigen::VectorXd(3);
+            Eigen::MatrixXd   JA(3, 3);
+            Eigen::VectorXd   Jr(3,1);
+            JA.setZero();
+            Jr.setZero();
+            
+            Eigen::Vector3d V = mesh.vertices_[pt_i];
+            
+            for(auto pt_iter = 0; pt_iter < visiblity_vertex_to_image[pt_i].size(); pt_iter++)
+            {
+                int cam_j = visiblity_vertex_to_image[pt_i][pt_iter];//当前点可见的图片索引
+                Eigen::Matrix4d pose;
+                pose = camera.parameters_[cam_j].extrinsic_;
+                Eigen::Vector4d G = pose * Eigen::Vector4d(V(0), V(1), V(2), 1);//变换到相机坐标
+                Eigen::Vector4d L = intr * G;
+                //投影到相机平面
+                double u = L(0) / L(2);
+                double v = L(1) / L(2);
+                if (!images_gray[cam_j]->TestImageBoundary(u, v, option.image_boundary_margin_))//没有超过边界
+                {
+                    continue;
+                }
+                
+                bool valid;
+                double gray, dIdx, dIdy;
+                std::tie(valid, gray) = images_gray[cam_j]->FloatValueAt(u, v);
+                std::tie(valid, dIdx) = images_dx[cam_j]->FloatValueAt(u, v);
+                std::tie(valid, dIdy) = images_dy[cam_j]->FloatValueAt(u, v);
+                
+                double r = (proxy_intensity[pt_i] - gray);
+                
+                //                if((dIdx*dIdx + dIdy*dIdy) < 100)//应该不是边界是平面不用优化吧，稍后考虑
+                //                {
+                //                    r = 0;
+                //                }
+                
+                Eigen::MatrixXd pt0(4,1);
+                Eigen::MatrixXd grad(1,2);
+                Eigen::MatrixXd Ju(2,4);
+                Eigen::MatrixXd Jg(4,3);
+                
+                grad<<dIdx, dIdy;
+                pt0<<G(0),G(1),G(2),1;
+                Jg<<pose(0,0), pose(0,1), pose(0,2),
+                        pose(1,0), pose(1,1), pose(1,2),
+                        pose(2,0), pose(2,1), pose(2,2),
+                        0,0,0;
+                Ju<<intr(0,0)/pt0(2,0), 0, -pt0(0,0)*intr(0,0)/(pt0(2,0)*pt0(2,0)), 0,
+                        0, intr(1,1)/pt0(2,0), -pt0(1,0)*intr(1,1)/(pt0(2,0)*pt0(2,0)), 0;
+                Eigen::MatrixXd J(1,3);
+                J = grad*Ju*Jg;
+                
+                //                std::vector<float > left;
+                //                left.resize(3);
+                //                left[0]=J(0,0);
+                //                left[1]=J(0,1);
+                //                left[2]=J(0,2);
+                JA += J.transpose()*J;
+                Jr += J.transpose()*r;
+                
+                //                JA.push_back(left);
+                //                Jb.push_back(r);
+                
+            }
+            
+            for(int k = 0; k < pts_2r_near[pt_i].size(); k++)
+            {
+                int pt_idx = pts_2r_near[pt_i][k];
+                Eigen::Vector3d n_V = mesh.vertices_[pt_idx];
+                for(int pt_iter = 0; pt_iter < visiblity_vertex_to_image[pt_idx].size(); pt_iter++)
+                {
+                    int cam_j = visiblity_vertex_to_image[pt_idx][pt_iter];//当前点可见的图片索引
+                    Eigen::Matrix4d pose;
+                    pose = camera.parameters_[cam_j].extrinsic_;
+                    Eigen::Vector4d G = pose * Eigen::Vector4d(n_V(0), n_V(1), n_V(2), 1);
+                    Eigen::Vector4d L = intr * G;
+                    
+                    double u = L(0) / L(2);
+                    double v = L(1) / L(2);
+                    if (!images_gray[cam_j]->TestImageBoundary(u, v, option.image_boundary_margin_))//没有超过边界
+                    {
+                        continue;
+                    }
+                    
+                    bool valid;
+                    double gray, dIdx, dIdy;
+                    std::tie(valid, gray) = images_gray[cam_j]->FloatValueAt(u, v);
+                    std::tie(valid, dIdx) = images_dx[cam_j]->FloatValueAt(u, v);
+                    std::tie(valid, dIdy) = images_dy[cam_j]->FloatValueAt(u, v);
+                    
+                    double r = (proxy_intensity[pt_idx] - gray);
+                    
+                    //                    if((dIdx*dIdx + dIdy*dIdy)<100)
+                    //                    {
+                    //                        r = 0;
+                    //                    }
+                    
+                    Eigen::MatrixXd pt0(4,1);
+                    Eigen::MatrixXd grad(1,2);
+                    Eigen::MatrixXd Ju(2,4);
+                    Eigen::MatrixXd Jg(4,3);
+                    
+                    grad<<dIdx, dIdy;
+                    pt0<<G(0),G(1),G(2),1;
+                    Jg<<pose(0,0), pose(0,1), pose(0,2),
+                            pose(1,0), pose(1,1), pose(1,2),
+                            pose(2,0), pose(2,1), pose(2,2),
+                            0,0,0;
+                    Ju<<intr(0,0)/pt0(2,0), 0, -pt0(0,0)*intr(0,0)/(pt0(2,0)*pt0(2,0)), 0,
+                            0, intr(1,1)/pt0(2,0), -pt0(1,0)*intr(1,1)/(pt0(2,0)*pt0(2,0)), 0;
+                    Eigen::MatrixXd J(1,3);
+                    J = grad*Ju*Jg;
+                    
+                    //                    std::vector<float > left;
+                    //                    left.resize(3);
+                    //                    left[0]=J(0,0);
+                    //                    left[1]=J(0,1);
+                    //                    left[2]=J(0,2);
+                    
+                    //                    JA.push_back(left);
+                    //                    Jb.push_back(r);
+                    
+                    //                    JA += J.transpose()*J;
+                    //                    Jr += J.transpose()*r;
+                }
+            }
+            //邻接正则项
+            Eigen::Vector3d  sumV(0, 0, 0);
+
+            for(int k = 0; k < pts_1r_near[pt_i].size(); k++)//1R 领域
+            {
+                int pt_idx = pts_1r_near[pt_i][k];
+                Eigen::Vector3d n_V = mesh.vertices_[pt_idx];
+                sumV += n_V;
+            }
+            sumV /= pts_1r_near[pt_i].size();
+            sumV = V - sumV;
+            Eigen::Matrix3d  tempJ = Eigen::Matrix3d::Identity();
+            //            JA += tempJ;
+            //            Jr += sumV;
+            
+            //正则项
+            //            JA += tempJ;
+            //            Jr += V;
+            
+            
+            //            if(JA.size() > 10)
+            //            {
+            //                Eigen::MatrixXf A_M(JA.size(),3);
+            //                Eigen::VectorXf B_M(Jb.size());
+            //                for(int m = 0; m < JA.size(); m++)
+            //                {
+            //                    for(int n = 0; n < 3; n++)
+            //                    {
+            //                        A_M(m,n)=JA[m][n];
+            //                    }
+            //                    B_M(m)=Jb[m];
+            //                }
+            
+            //                std::cout<<"a_m:"<<std::endl<<A_M<<std::endl;
+            //                std::cout<<"b_m:"<<std::endl<<B_M<<std::endl;
+            x_M = -JA.jacobiSvd(Eigen::ComputeThinU | Eigen::ComputeThinV).solve(Jr);
+            //                std::cout<<"xM:"<<std::endl<<x_M<<endl;
+            float lenth = sqrt(x_M(0)*x_M(0) + x_M(1)*x_M(1) + x_M(2)*x_M(2));
+            //if(lenth>0.0001)
+            if( lenth > 0.000001)
+            {
+                //沿法向方向移动;
+                Eigen::Vector3d  n = mesh.vertex_normals_[pt_i];
+                x_M(0) = -x_M(0)*n(0);
+                x_M(1) = -x_M(1)*n(1);
+                x_M(2) = -x_M(2)*n(2);
+                //                    std::cout<<"pt_i:"<<pt_i<<"----"<<x_M(0)<<" "<<x_M(1)<<" "<<x_M(2)<<std::endl;
+                
+            }
+            //                std::cout<<"pt_i:"<<pt_i<<"----------JA size:"<<JA.size()<<"  length:"<<lenth<<std::endl;
+            pt_offset[pt_i](0) = x_M(0);
+            pt_offset[pt_i](1) = x_M(1);
+            pt_offset[pt_i](2) = x_M(2);
+        }
+        
+        //        offsetSmooth(mesh, oct, pt_offset);
+        
+        updateMesh(mesh, pt_offset);
+        mesh.ComputeTriangleNormals();
+        mesh.ComputeVertexNormals();
+
+        SetProxyIntensityForVertex(mesh, images_gray, camera,
+                                   visiblity_vertex_to_image, proxy_intensity,
+                                   option.image_boundary_margin_);
+    }
+}
+
+
+
+void updateMeshBaseOrig(geometry::TriangleMesh& mesh, std::vector<Eigen::Vector3d >  tempmesh, std::vector<Eigen::Vector3d >  pt_offset)
+{
+    for(int i = 0; i < mesh.vertices_.size(); i++)
+    {
+        mesh.vertices_[i](0) = tempmesh[i](0) + pt_offset[i](0);
+        mesh.vertices_[i](1) = tempmesh[i](1) + pt_offset[i](1);
+        mesh.vertices_[i](2) = tempmesh[i](2) + pt_offset[i](2);
+    }
+}
+
+double getTriArea(geometry::TriangleMesh& mesh, Eigen::Vector3i v_idx)
+{
+    Eigen::Vector3d  v1 = mesh.vertices_[v_idx(0)];
+    Eigen::Vector3d  v2 = mesh.vertices_[v_idx(1)];
+    Eigen::Vector3d  v3 = mesh.vertices_[v_idx(2)];
+
+    Eigen::Vector3d  v12 = v2 - v1;
+    Eigen::Vector3d  v13 = v3 - v1;
+
+    Eigen::Vector3d  v = v12.cross(v13);
+    return 0.5*(std::sqrt(v.dot(v)));//the area of the triangle
+}
+
+void computerBoostNormal(geometry::TriangleMesh& mesh, std::vector<Eigen::Vector3d >  &boostnormals, std::vector<Eigen::Vector3d >  &smoothnormals)
+{
+    boostnormals.clear();
+    boostnormals.resize(mesh.triangles_.size());
+
+    smoothnormals.clear();
+    smoothnormals.resize(mesh.triangles_.size());
+
+    float  arb = 1.5;//按论文<High-boost mesh filtering for 3d shap enhancement>设置为1.5
+    for(int loop = 0; loop < 10; loop++)
+    {
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+        for(int f_idx = 0; f_idx < mesh.triangles_.size(); f_idx++)
+        {
+            std::unordered_set<int> nadjfaces = mesh.Nadjfaces[f_idx];
+
+            Eigen::Vector3d  sumNorm(0.0f, 0.0f, 0.0f);
+            double   sumArea = 0.0;
+            for(std::unordered_set<int>::iterator iter = nadjfaces.begin(); iter != nadjfaces.end(); iter++)
+            {
+                int nf_idx = *iter;//
+                Eigen::Vector3i  nf = mesh.triangles_[nf_idx];
+                double area = getTriArea(mesh, nf);
+                Eigen::Vector3d  m;
+                if(loop == 0)
+                {
+                    m = mesh.triangle_normals_[nf_idx];
+                }
+                else
+                {
+                    m = smoothnormals[nf_idx];
+                }
+                sumNorm += area*m;
+                sumArea += area;
+            }
+            Eigen::Vector3d  ntk_norm = sumNorm/sumArea;//Eq.1
+            ntk_norm.normalize();
+            smoothnormals[f_idx] = ntk_norm;
+        }
+    }
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for(int f_idx = 0; f_idx < mesh.triangles_.size(); f_idx++)
+    {
+        //        std::unordered_set<int> nadjfaces = mesh.Nadjfaces[f_idx];
+
+        //        Eigen::Vector3d  sumNorm(0.0f, 0.0f, 0.0f);
+        //        double   sumArea = 0.0;
+        //        for(std::unordered_set<int>::iterator iter = nadjfaces.begin(); iter != nadjfaces.end(); iter++)
+        //        {
+        //            int nf_idx = *iter;//
+        //            Eigen::Vector3i  nf = mesh.triangles_[nf_idx];
+        //            double area = getTriArea(mesh, nf);
+        //            Eigen::Vector3d  m = mesh.triangle_normals_[nf_idx];
+        //            sumNorm += area*m;
+        //            sumArea += area;
+        //        }
+        //        Eigen::Vector3d  ntk_norm = sumNorm/sumArea;//Eq.1
+        //        ntk_norm.normalize();
+        //        smoothnormals[f_idx] = ntk_norm;
+        //        boostnormals[f_idx] = f_norm;
+        Eigen::Vector3d  ntk_norm = smoothnormals[f_idx];
+        Eigen::Vector3d  nt_norm = mesh.triangle_normals_[f_idx];
+        Eigen::Vector3d  m_norm = (1+arb)*nt_norm - arb*ntk_norm;
+        m_norm.normalize();
+        boostnormals[f_idx] = m_norm;//Eq.2;
+//        std::cout<<"--------------i:"<<f_idx<<std::endl;
+//                std::cout<<"-------------norm:"<<nt_norm(0)<<" "<<nt_norm(1)<<" "<<nt_norm(2)<<" "<<std::endl;
+//                std::cout<<"-----------smooth:"<<ntk_norm(0)<<" "<<ntk_norm(1)<<" "<<ntk_norm(2)<<" "<<std::endl;
+//                std::cout<<"-----------boost:"<<m_norm(0)<<" "<<m_norm(1)<<" "<<m_norm(2)<<" "<<std::endl<<std::endl;;
+
+    }
+}
+
+bool  detectFaceOrientation(Eigen::Vector3d v0, Eigen::Vector3d v1, Eigen::Vector3d v2, Eigen::Vector3d norm)
+{
+    Eigen::Vector3d  v01 = v1 - v0;
+    Eigen::Vector3d  v02 = v2 - v0;
+    Eigen::Vector3d  v = v01.cross(v02);
+    v.normalize();
+    bool flag = true;
+    if(norm.dot(v) > 0)
+    {
+        flag = true;
+    }
+    else
+    {
+        flag = false;
+    }
+    return flag;
+}
+
+void  getProjectTri(Eigen::Vector3d v0, Eigen::Vector3d v1, Eigen::Vector3d v2, Eigen::Vector3d &pv0, Eigen::Vector3d &pv1, Eigen::Vector3d &pv2, Eigen::Vector3d norm)
+{
+
+    pv0 = v0;
+    pv1 = v1 - ((v1 - v0).dot(norm))*norm;
+    pv2 = v2 - ((v2 - v0).dot(norm))*norm;
+
+}
+
+void  getProjectTriWithRotation(Eigen::Vector3d v0, Eigen::Vector3d v1, Eigen::Vector3d v2, Eigen::Vector3d &pv0, Eigen::Vector3d &pv1, Eigen::Vector3d &pv2, Eigen::Vector3d norm, Eigen::Matrix3d rot)
+{
+
+    pv0 = rot*v0;
+    pv1 = rot*v1;
+    pv2 = rot*v2;
+
+}
+
+/**
+ * @brief getRotationBetweenNormals 根据法线计算两个平面之间的旋转矩阵
+ * @param norm1
+ * @param norm2
+ * @param rotation
+ */
+void getRotationBetweenNormals(const Eigen::Vector3d norm1, const Eigen::Vector3d norm2, Eigen::Matrix3d &rotation)
+{
+    //applying Rodriguess's Formula
+    Eigen::Vector3d  sinThetaRotaVect = norm1.cross(norm2);
+    Eigen::Vector3d unitRotaVect = sinThetaRotaVect.normalized();//rotate pivot
+    float cosTheta = norm1.dot(norm2);
+    Eigen::Matrix3d  I = Eigen::Matrix3d::Identity();
+    Eigen::Matrix<double, 3, 3, Eigen::RowMajor> asymMatrix;
+    asymMatrix<<0,-sinThetaRotaVect(2),sinThetaRotaVect(1),
+                         sinThetaRotaVect(2), 0, -sinThetaRotaVect(0),
+                         -sinThetaRotaVect(1), sinThetaRotaVect(0), 0;
+    rotation =  cosTheta*I;
+    rotation += (1-cosTheta)*unitRotaVect*unitRotaVect.transpose();
+    rotation += asymMatrix;
+}
+
+//Eq.5
+Eigen::Vector3d getGradientByArea(Eigen::Vector3d v0, Eigen::Vector3d v1, Eigen::Vector3d v2)
+{
+    double a,b;
+    //compute a
+    {
+        Eigen::Vector3d  v10 = v0 - v1;
+        Eigen::Vector3d  v12 = v2 - v1;
+        v10.normalize(); v12.normalize();
+        double cosa = v10.dot(v12);
+
+        v10 = v10.cross(v12);
+        double sina = std::sqrt(v10.dot(v10));
+        a = cosa/sina;
+        if(std::isnan(a))
+        {
+            std::cout<<sina<<std::endl;
+        }
+    }
+
+    //compute b
+    {
+        Eigen::Vector3d  v20 = v0 - v2;
+        Eigen::Vector3d  v21 = v1 - v2;
+        v20.normalize();
+        v21.normalize();
+        double cosb = v20.dot(v21);
+
+        v20 = v20.cross(v21);
+        double sinb = std::sqrt(v20.dot(v20));
+        b = cosb/sinb;
+
+        if(std::isnan(b))
+        {
+            std::cout<<sinb<<std::endl;
+        }
+    }
+    Eigen::Vector3d grad = -0.5*((v1 - v0)*b + (v2 - v0)*a);//注意论文中图图6中，a，b对应的顶点位置
+    if(std::isnan(grad(0)) || std::isnan(grad(1)) || std::isnan(grad(2)))
+    {
+//        std::cout<<"v0:"<<v0(0)<<" "<<v0(1)<<" "<<v0(2)<<std::endl;
+//        std::cout<<"v1:"<<v1(0)<<" "<<v1(1)<<" "<<v1(2)<<std::endl;
+//        std::cout<<"v2:"<<v2(0)<<" "<<v2(1)<<" "<<v2(2)<<std::endl;
+        grad.setZero();
+    }
+    return grad;
+}
+
+void OptimizeColorAndMeshWithNormalOption(geometry::TriangleMesh& mesh,
+                                          const std::vector<std::shared_ptr<geometry::Image>>& images_gray,
+                                          const std::vector<std::shared_ptr<geometry::Image>>& images_color,
+                                          const std::vector<std::shared_ptr<geometry::Image>>& images_dx,
+                                          const std::vector<std::shared_ptr<geometry::Image>>& images_dy,
+                                          const std::vector<std::shared_ptr<geometry::Image>>& images_depth,
+                                          camera::PinholeCameraTrajectory& camera,
+                                          const std::vector<std::vector<int>>& visiblity_vertex_to_image,
+                                          const std::vector<std::vector<int>>& visiblity_image_to_vertex,
+                                          std::vector<double>& proxy_intensity,
+                                          const ColorMapOptimizationOption& option)
+{
+    //网格优化预处理
+    std::vector<std::vector<int> >  pts_1r_near, pts_2_3Rnear;//半径r相邻;
+    mesh.meshVerticesInfoUpdata();
+
+    compute1Rnear(mesh, pts_1r_near);//取出每个顶点的1环邻接点
+    compute2_3Rnear(mesh, pts_2_3Rnear);
+
+    //用于记录每次的偏移量;
+    std::vector<Eigen::Vector3d >  pt_offset;
+    std::vector<Eigen::Vector3d >  tempmesh;
+    initOffset(pt_offset, mesh.vertices_.size());
+    initmesh(tempmesh, mesh);
+
+    std::vector<Eigen::Vector3d>  boostnormals;
+    std::vector<Eigen::Vector3d>  smoothnormals;
+    computerBoostNormal(mesh, boostnormals, smoothnormals);
+
+    std::vector<std::vector<int> >  adj_1r_faces;
+    compute1RFaces(mesh, adj_1r_faces);
+
+    int total_num_ = 0;
+    auto n_camera = camera.parameters_.size();
+
+    Eigen::Matrix4d intr = Eigen::Matrix4d::Zero();
+    intr.block<3,3>(0,0) = camera.parameters_[0].intrinsic_.intrinsic_matrix_;
+    intr(3, 3) = 1.0;
+    std::cout<<"-----------------intr:"<<std::endl<<intr<<std::endl;
+    double fx = intr(0, 0);
+    double fy = intr(1, 1);
+    SetProxyIntensityForVertex(mesh, images_gray, camera,
+                               visiblity_vertex_to_image, proxy_intensity,
+                               option.image_boundary_margin_);
+
+    //depth grad
+    std::vector<std::shared_ptr<geometry::Image> > depths_dx;
+    std::vector<std::shared_ptr<geometry::Image> > depths_dy;
+    for(int i = 0; i<images_depth.size(); i++)
+    {
+        auto target_pyramid_dx = geometry::FilterImage(*images_depth[i], geometry::Image::FilterType::Sobel3Dx);
+        auto target_pyramid_dy = geometry::FilterImage(*images_depth[i], geometry::Image::FilterType::Sobel3Dy);
+        depths_dx.push_back(target_pyramid_dx);
+        depths_dy.push_back(target_pyramid_dy);
+    }
+
+    for (int itr = 0; itr < option.maximum_iteration_; itr++)
+    {
+
+        std::cout<<"Iteration:"<<itr+1<<std::endl;
+        double residual = 0.0;
+        total_num_ = 0;
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+        for(int c = 0; c < n_camera; c++)
+        {
+            Eigen::Matrix4d pose;
+            pose = camera.parameters_[c].extrinsic_;
+            auto intrinsic = camera.parameters_[c].intrinsic_.intrinsic_matrix_;
+            auto extrinsic = camera.parameters_[c].extrinsic_;
+
+            ColorMapOptimizationJacobian jac;
+            Eigen::Matrix4d intr = Eigen::Matrix4d::Zero();
+            intr.block<3, 3>(0, 0) = intrinsic;
+            intr(3, 3) = 1.0;
+
+            auto f_lambda = [&](int i, Eigen::Vector6d& J_r, double& r)
+            {
+                jac.ComputeJacobianAndResidualRigid(
+                            i, J_r, r, mesh, proxy_intensity, images_gray[c],
+                            images_dx[c], images_dy[c], intr, extrinsic,
+                            visiblity_image_to_vertex[c],
+                            option.image_boundary_margin_);
+            };
+
+            Eigen::Matrix6d JTJ;
+            Eigen::Vector6d JTr;
+            double r2;
+            std::tie(JTJ, JTr, r2) =
+                    utility::ComputeJTJandJTr<Eigen::Matrix6d, Eigen::Vector6d>(
+                        f_lambda, visiblity_image_to_vertex[c].size(),
+                        false);
+            bool is_success;
+            Eigen::Matrix4d delta;
+            std::tie(is_success, delta) = utility::SolveJacobianSystemAndObtainExtrinsicMatrix(JTJ, JTr);
+            pose = delta * pose;
+            camera.parameters_[c].extrinsic_ = pose;
+#ifdef _OPENMP
+#pragma omp critical
+#endif
+            {
+                residual += r2;
+                total_num_ += visiblity_image_to_vertex[c].size();
+            }
+
+        }
+        std::cout<<"Residual error :"<<residual<<" avg:"<<residual / total_num_<<std::endl;
+        SetProxyIntensityForVertex(mesh, images_gray, camera,
+                                   visiblity_vertex_to_image, proxy_intensity,
+                                   option.image_boundary_margin_);
+    }
+    //    saveCameraPose(camera, "option.log");
+
+    SetGeometryColorAverage(mesh, images_color, camera,
+                            visiblity_vertex_to_image, option.image_boundary_margin_);
+    open3d::io::WriteTriangleMesh("option1.ply",mesh);
+    for (int itr = 0; itr < 20; itr++)
+    {
+        std::cout<<"----------iter:"<<itr<<std::endl;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+        for(int pt_i = 0; pt_i < mesh.vertices_.size(); pt_i++)
+        {
+            Eigen::MatrixXd  JA(3, 3);
+            Eigen::VectorXd  Jb(3);
+            JA.setZero();
+            Jb.setZero();
+
+            //            Eigen::VectorXd x_M = Eigen::VectorXd(3);
+
+            if(mesh.verticesInfo[pt_i] != open3d::geometry::TriangleMesh::VERTEX_CLASS_SIMPLE)
+            {
+                continue;
+            }
+
+            Eigen::Vector3d V = mesh.vertices_[pt_i];
+            if(visiblity_vertex_to_image[pt_i].size() < 2)
+            {
+                continue;
+            }
+
+            for(auto pt_iter = 0; pt_iter < visiblity_vertex_to_image[pt_i].size(); pt_iter++)
+            {
+                int cam_j = visiblity_vertex_to_image[pt_i][pt_iter];//当前点可见的图片索引
+                Eigen::Matrix4d pose;
+                pose = camera.parameters_[cam_j].extrinsic_;
+                Eigen::Vector4d G = pose * Eigen::Vector4d(V(0), V(1), V(2), 1);
+                Eigen::Vector4d L = intr * G;
+                double u = L(0) / L(2);
+                double v = L(1) / L(2);
+
+                if (!images_gray[cam_j]->TestImageBoundary(u, v, option.image_boundary_margin_))//没有超过边界
+                {
+                    continue;
+                }
+                bool valid;
+                double gray, dIdx, dIdy;
+                std::tie(valid, gray) = images_gray[cam_j]->FloatValueAt(u, v);
+                std::tie(valid, dIdx) = images_dx[cam_j]->FloatValueAt(u, v);
+                std::tie(valid, dIdy) = images_dy[cam_j]->FloatValueAt(u, v);
+
+                if (gray == -1.0)
+                {
+                    continue;
+                }
+
+                double r = (proxy_intensity[pt_i] - gray);
+                Eigen::MatrixXd pt0(4, 1);
+                Eigen::MatrixXd grad(1, 2);
+                Eigen::MatrixXd Ju(2, 4);
+                Eigen::MatrixXd Jg(4, 3);
+
+                grad<<dIdx, dIdy;
+                pt0<<G(0), G(1), G(2), 1;
+                Jg<<pose(0,0), pose(0,1), pose(0,2),
+                        pose(1,0), pose(1,1), pose(1,2),
+                        pose(2,0), pose(2,1), pose(2,2),
+                        0,0,0;
+                Ju<<intr(0,0)/pt0(2,0), 0, -pt0(0,0)*intr(0,0)/(pt0(2,0)*pt0(2,0)), 0,
+                        0, intr(1,1)/pt0(2,0), -pt0(1,0)*intr(1,1)/(pt0(2,0)*pt0(2,0)), 0;
+                Eigen::MatrixXd J(1,3);
+                J = grad*Ju*Jg;//这里求导应该是有个负号的
+
+                JA += J.transpose()*J*20*20;
+                Jb += -J.transpose()*r*20;
+
+                //depth
+                int i_u = int(round(u));
+                int i_v = int(round(v));
+                double dDdx = (*geometry::PointerAt<float>(*depths_dx[cam_j], i_u, i_v));
+                double dDdy = (*geometry::PointerAt<float>(*depths_dy[cam_j], i_u, i_v));
+
+                if (std::isnan(dDdx))
+                {
+                    dDdx = 0;
+                }
+                if (std::isnan(dDdy))
+                {
+                    dDdy = 0;
+                }
+
+                Eigen::MatrixXd dpt0(4,1);
+                Eigen::MatrixXd dgrad(1,2);
+                Eigen::MatrixXd dJu(2,4);
+                Eigen::MatrixXd dJg(4,3);
+                dgrad<<dDdx, dDdy;
+                dpt0<<G(0), G(1), G(2), 1;
+
+                dJg<<pose(0,0), pose(0,1), pose(0,2),
+                        pose(1,0), pose(1,1), pose(1,2),
+                        pose(2,0), pose(2,1), pose(2,2),
+                        0, 0, 0;
+                dJu<<intr(0,0)/dpt0(2,0), 0, -dpt0(0,0)*intr(0,0)/(dpt0(2,0)*dpt0(2,0)), 0,
+                        0, intr(1,1)/dpt0(2,0), -dpt0(1,0)*intr(1,1)/(dpt0(2,0)*dpt0(2,0)), 0;
+                Eigen::MatrixXd dJ(1,3);
+                dJ = dgrad*dJu*dJg;//这里求导应该是有个负号的
+
+                double diff_geo = G(2)  - *geometry::PointerAt<float>(*images_depth[cam_j], i_u, i_v);
+                JA += dJ.transpose()*dJ*20*20;
+                Jb += -dJ.transpose()*diff_geo*20;
+            }
+
+
+            //Enhancement term ref <High-boost mesh filtering for 3D shape Enhancement>
+            std::vector<int>  adj_faces = adj_1r_faces[pt_i];
+            Eigen::Vector3d  sum_boost_v(0.0f, 0.0f, 0.0f);
+            for(int ix = 0; ix < adj_faces.size(); ix++)
+            {
+                int fidx = adj_faces[ix];
+                Eigen::Vector3i  v_ix = mesh.triangles_[fidx];
+                Eigen::Vector3d  v0, v1, v2;
+                for(int v_i = 0; v_i < 3; v_i++)
+                {
+                    if(v_ix(v_i) == pt_i)
+                    {
+                        v0 = mesh.vertices_[v_ix(v_i)];
+                        v1 = mesh.vertices_[v_ix((v_i + 1)%3)];
+                        v2 = mesh.vertices_[v_ix((v_i + 2)%3)];
+                        Eigen::Vector3d  fnorm = mesh.triangle_normals_[fidx];
+                        //detect face direction
+                        if(detectFaceOrientation(v0, v1, v2, fnorm) == false)
+                        {
+                            Eigen::Vector3d tmpv = v1;
+                            v1 = v2;
+                            v2 = tmpv;
+                        }
+                        break;
+                    }
+                }
+                //                std::cout<<"--------------------1----------------------"<<std::endl;
+                //                std::cout<<V<<std::endl;
+                //                std::cout<<v0<<std::endl;
+
+                Eigen::Vector3d  bnorm = boostnormals[fidx];
+                Eigen::Vector3d  pv0, pv1, pv2;
+                getProjectTri(v0, v1, v2, pv0, pv1, pv2, bnorm);
+
+                Eigen::Vector3d  sgrad = getGradientByArea(v0, v1, v2);
+                Eigen::Vector3d  bgrad = getGradientByArea(pv0, pv1, pv2);
+                Eigen::Vector3d grad = sgrad - bgrad;
+                sum_boost_v += grad;
+            }
+            Eigen::Vector3d  b_v = 0.1*sum_boost_v;
+            Eigen::Matrix3d  Jboost = Eigen::Matrix3d::Identity();
+
+            JA += Jboost*2000*2000;
+            Jb += Jboost*b_v*2000;
+
+
+
+            //
+            Eigen::Vector3d  sumV(0.0, 0.0, 0.0);
+            double sum_dist = 0.0;
+            for(int k = 0; k<pts_1r_near[pt_i].size(); k++)
+            {
+                int pt_idx = pts_1r_near[pt_i][k];
+                Eigen::Vector3d n_V = mesh.vertices_[pt_idx];
+                double dist = std::sqrt(n_V.dot(V));
+                sumV += dist*n_V;
+                sum_dist += dist;
+            }
+
+            sumV = sumV/sum_dist;
+            sumV = 0.5*V - 0.5*sumV;
+            Eigen::Matrix3d  Ji = Eigen::Matrix3d::Identity();
+            JA += Ji*100*100;
+            Jb += Ji*sumV*100;
+
+            //Reg  ：权重100
+            Eigen::Vector3d  tempv = mesh.vertices_[pt_i];
+            Eigen::Matrix3d  J_r = Eigen::Matrix3d::Identity();
+            Eigen::Vector3d  vg = V - tempv;
+//            JA += J_r*1000*1000;
+//            Jb += J_r*vg*1000;
+
+
+            // solve
+            Eigen::VectorXd result(3);
+            result = JA.jacobiSvd(Eigen::ComputeThinU | Eigen::ComputeThinV).solve(-Jb);
+            Eigen::VectorXd x_M = result;
+            if(std::isnan(x_M(0)) || std::isnan(x_M(1)) || std::isnan(x_M(2))
+                    || (x_M(0) > 0.5 || x_M(1) > 0.5 || x_M(2) > 0.5))
+            {
+                x_M(0) = x_M(1) = x_M(2) = 0.0;
+            }
+            pt_offset[pt_i](0) += x_M(0);
+            pt_offset[pt_i](1) += x_M(1);
+            pt_offset[pt_i](2) += x_M(2);
+        }
+        updateMeshBaseOrig(mesh, tempmesh, pt_offset);
+//        mesh.ComputeTriangleNormals();
+//        computerBoostNormal(mesh, boostnormals, smoothnormals);
+
+        SetProxyIntensityForVertex(mesh, images_gray, camera,
+                                   visiblity_vertex_to_image, proxy_intensity,
+                                   option.image_boundary_margin_);
+    }
+    std::cout<<"1-----------------end:"<<std::endl;
+
+}
+
+void colorConsisten(geometry::TriangleMesh& mesh,
+                    const std::vector<std::shared_ptr<geometry::Image>>& images_gray,
+                    const std::vector<std::shared_ptr<geometry::Image>>& images_color,
+                    const std::vector<std::shared_ptr<geometry::Image>>& images_dx,
+                    const std::vector<std::shared_ptr<geometry::Image>>& images_dy,
+                    const std::vector<std::shared_ptr<geometry::Image>>& images_depth,
+                    camera::PinholeCameraTrajectory& camera,
+                    const std::vector<std::vector<int>>& visiblity_vertex_to_image,
+                    const std::vector<std::vector<int>>& visiblity_image_to_vertex,
+                    std::vector<double>& proxy_intensity,
+                    const ColorMapOptimizationOption& option)
+{
+    return;
+}
+void OptimizeColorAndMeshIterWithNormalOption(geometry::TriangleMesh& mesh,
+                                          const std::vector<std::shared_ptr<geometry::Image>>& images_gray,
+                                          const std::vector<std::shared_ptr<geometry::Image>>& images_color,
+                                          const std::vector<std::shared_ptr<geometry::Image>>& images_dx,
+                                          const std::vector<std::shared_ptr<geometry::Image>>& images_dy,
+                                          const std::vector<std::shared_ptr<geometry::Image>>& images_depth,
+                                          camera::PinholeCameraTrajectory& camera,
+                                          const std::vector<std::vector<int>>& visiblity_vertex_to_image,
+                                          const std::vector<std::vector<int>>& visiblity_image_to_vertex,
+                                          std::vector<double>& proxy_intensity,
+                                          const ColorMapOptimizationOption& option)
+{
+
+    //网格优化预处理
+    std::vector<std::vector<int> >  pts_1r_near, pts_2_3Rnear;//半径r相邻;
+    mesh.meshVerticesInfoUpdata();
+
+    compute1Rnear(mesh, pts_1r_near);//取出每个顶点的1环邻接点
+//    compute2_3Rnear(mesh, pts_2_3Rnear);
+
+    //用于记录每次的偏移量;
+    std::vector<Eigen::Vector3d >  pt_offset;
+    std::vector<Eigen::Vector3d >  tempmesh;
+    initOffset(pt_offset, mesh.vertices_.size());
+    initmesh(tempmesh, mesh);
+
+    std::vector<Eigen::Vector3d>  boostnormals;
+    std::vector<Eigen::Vector3d>  smoothnormals;
+    computerBoostNormal(mesh, boostnormals, smoothnormals);
+
+    std::vector<std::vector<int> >  adj_1r_faces;
+    compute1RFaces(mesh, adj_1r_faces);
+
+//    int total_num_ = 0;
+//    auto n_camera = camera.parameters_.size();
+
+    Eigen::Matrix4d depthintr = Eigen::Matrix4d::Zero();
+    depthintr.block<3,3>(0,0) = camera.parameters_[0].depthintrinsic_.intrinsic_matrix_;
+    depthintr(3, 3) = 1.0;
+
+    Eigen::Matrix4d colorintr = Eigen::Matrix4d::Zero();
+    colorintr.block<3,3>(0,0) = camera.parameters_[0].colorintrinsic_.intrinsic_matrix_;
+    colorintr(3, 3) = 1.0;
+
+//    std::cout<<"-----------------intr:"<<std::endl<<intr<<std::endl;
+
+    SetProxyIntensityForVertex(mesh, images_gray, camera,
+                               visiblity_vertex_to_image, proxy_intensity,
+                               option.image_boundary_margin_);
+
+    //depth grad
+    std::vector<std::shared_ptr<geometry::Image> > depths_dx;
+    std::vector<std::shared_ptr<geometry::Image> > depths_dy;
+    for(int i = 0; i<images_depth.size(); i++)
+    {
+        auto target_pyramid_dx = geometry::FilterImage(*images_depth[i], geometry::Image::FilterType::Sobel3Dx);
+        auto target_pyramid_dy = geometry::FilterImage(*images_depth[i], geometry::Image::FilterType::Sobel3Dy);
+        depths_dx.push_back(target_pyramid_dx);
+        depths_dy.push_back(target_pyramid_dy);
+    }
+
+    for(int iter = 0; iter < JointTGConfig::get().EXTERNAL_ITER_NUM; iter++)
+    {
+        //color optimization
+        OptimizeImageCoorRigid(mesh, images_gray, images_dx, images_dy, camera,
+                               visiblity_vertex_to_image,
+                               visiblity_image_to_vertex, proxy_intensity,
+                               option);
+        SetGeometryColorAverage(mesh, images_color, camera,
+                                visiblity_vertex_to_image,
+                                option.image_boundary_margin_);
+
+        colorConsisten(mesh, images_gray, images_color, images_dx, images_dy, images_depth, camera,
+                       visiblity_vertex_to_image,
+                       visiblity_image_to_vertex, proxy_intensity,
+                       option);
+
+
+        //mesh optimization
+        for (int itr = 0; itr < JointTGConfig::get().GEO_ITER_NUM; itr++)
+        {
+            std::cout<<"---------geometry optimization iter:"<<itr<<"/"<<JointTGConfig::get().GEO_ITER_NUM<<std::endl;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+            for(int pt_i = 0; pt_i < mesh.vertices_.size(); pt_i++)
+            {
+                Eigen::MatrixXd  C_A(3, 3);
+                Eigen::VectorXd  C_b(3);
+                C_A.setZero();
+                C_b.setZero();
+
+                Eigen::MatrixXd  D_A(3, 3);
+                Eigen::VectorXd  D_b(3);
+                D_A.setZero();
+                D_b.setZero();
+
+                Eigen::MatrixXd  H_A(3, 3);
+                Eigen::VectorXd  H_b(3);
+                H_A.setZero();
+                H_b.setZero();
+
+                Eigen::MatrixXd  L_A(3, 3);
+                Eigen::VectorXd  L_b(3);
+                L_A.setZero();
+                L_b.setZero();
+
+                Eigen::MatrixXd  S_A(3, 3);
+                Eigen::VectorXd  S_b(3);
+                S_A.setZero();
+                S_b.setZero();
+
+
+
+                //            Eigen::VectorXd x_M = Eigen::VectorXd(3);
+
+                if(mesh.verticesInfo[pt_i] != open3d::geometry::TriangleMesh::VERTEX_CLASS_SIMPLE)
+                {
+                    continue;
+                }
+
+                Eigen::Vector3d V = mesh.vertices_[pt_i];
+//                if(visiblity_vertex_to_image[pt_i].size() < 2)
+//                {
+//                    continue;
+//                }
+
+                for(auto pt_iter = 0; pt_iter < visiblity_vertex_to_image[pt_i].size(); pt_iter++)
+                {
+                    int cam_j = visiblity_vertex_to_image[pt_i][pt_iter];//当前点可见的图片索引
+                    Eigen::Matrix4d pose;
+                    pose = camera.parameters_[cam_j].extrinsic_;
+                    Eigen::Vector4d G = pose * Eigen::Vector4d(V(0), V(1), V(2), 1);
+                    Eigen::Vector4d L = colorintr * G;
+                    double u = L(0) / L(2);
+                    double v = L(1) / L(2);
+
+                    if (!images_gray[cam_j]->TestImageBoundary(u, v, option.image_boundary_margin_))//没有超过边界
+                    {
+                        continue;
+                    }
+                    bool valid;
+                    double gray, dIdx, dIdy;
+                    std::tie(valid, gray) = images_gray[cam_j]->FloatValueAt(u, v);
+                    std::tie(valid, dIdx) = images_dx[cam_j]->FloatValueAt(u, v);
+                    std::tie(valid, dIdy) = images_dy[cam_j]->FloatValueAt(u, v);
+
+                    if (gray == -1.0)
+                    {
+                        continue;
+                    }
+
+                    double r = (proxy_intensity[pt_i] - gray);
+                    Eigen::MatrixXd pt0(4, 1);
+                    Eigen::MatrixXd grad(1, 2);
+                    Eigen::MatrixXd Ju(2, 4);
+                    Eigen::MatrixXd Jg(4, 3);
+
+                    grad<<dIdx, dIdy;
+                    pt0<<G(0), G(1), G(2), 1;
+                    Jg<<pose(0,0), pose(0,1), pose(0,2),
+                            pose(1,0), pose(1,1), pose(1,2),
+                            pose(2,0), pose(2,1), pose(2,2),
+                            0,0,0;
+                    Ju<<colorintr(0,0)/pt0(2,0), 0, -pt0(0,0)*colorintr(0,0)/(pt0(2,0)*pt0(2,0)), 0,
+                            0, colorintr(1,1)/pt0(2,0), -pt0(1,0)*colorintr(1,1)/(pt0(2,0)*pt0(2,0)), 0;
+                    Eigen::MatrixXd J(1,3);
+                    J = grad*Ju*Jg;//这里求导应该是有个负号的
+
+                    C_A += J.transpose()*J;
+                    C_b += -J.transpose()*r;
+
+                    //depth
+                    Eigen::Vector4d dL = depthintr * G;
+                    double du = dL(0) / dL(2);
+                    double dv = dL(1) / dL(2);
+
+                    int i_u = int(round(du));
+                    int i_v = int(round(dv));
+                    double dDdx = (*geometry::PointerAt<float>(*depths_dx[cam_j], i_u, i_v));
+                    double dDdy = (*geometry::PointerAt<float>(*depths_dy[cam_j], i_u, i_v));
+
+                    if (std::isnan(dDdx))
+                    {
+                        dDdx = 0;
+                    }
+                    if (std::isnan(dDdy))
+                    {
+                        dDdy = 0;
+                    }
+
+                    Eigen::MatrixXd dpt0(4,1);
+                    Eigen::MatrixXd dgrad(1,2);
+                    Eigen::MatrixXd dJu(2,4);
+                    Eigen::MatrixXd dJg(4,3);
+                    dgrad<<dDdx, dDdy;
+                    dpt0<<G(0), G(1), G(2), 1;
+
+                    dJg<<pose(0,0), pose(0,1), pose(0,2),
+                            pose(1,0), pose(1,1), pose(1,2),
+                            pose(2,0), pose(2,1), pose(2,2),
+                            0, 0, 0;
+                    dJu<<depthintr(0,0)/dpt0(2,0), 0, -dpt0(0,0)*depthintr(0,0)/(dpt0(2,0)*dpt0(2,0)), 0,
+                            0, depthintr(1,1)/dpt0(2,0), -dpt0(1,0)*depthintr(1,1)/(dpt0(2,0)*dpt0(2,0)), 0;
+                    Eigen::MatrixXd dJ(1,3);
+                    dJ = dgrad*dJu*dJg;//这里求导应该是有个负号的
+
+                    double diff_geo = G(2)  - *geometry::PointerAt<float>(*images_depth[cam_j], i_u, i_v);
+                    D_A += dJ.transpose()*dJ;
+                    D_b += -dJ.transpose()*diff_geo;
+                }
+
+
+                //Enhancement term ref <High-boost mesh filtering for 3D shape Enhancement>
+                std::vector<int>  adj_faces = adj_1r_faces[pt_i];
+                Eigen::Vector3d  sum_boost_v(0.0f, 0.0f, 0.0f);
+                for(int ix = 0; ix < adj_faces.size(); ix++)
+                {
+                    int fidx = adj_faces[ix];
+                    Eigen::Vector3i  v_ix = mesh.triangles_[fidx];
+                    Eigen::Vector3d  v0, v1, v2;
+                    for(int v_i = 0; v_i < 3; v_i++)
+                    {
+                        if(v_ix(v_i) == pt_i)
+                        {
+                            v0 = mesh.vertices_[v_ix(v_i)];
+                            v1 = mesh.vertices_[v_ix((v_i + 1)%3)];
+                            v2 = mesh.vertices_[v_ix((v_i + 2)%3)];
+                            Eigen::Vector3d  fnorm = mesh.triangle_normals_[fidx];
+                            //detect face direction
+                            if(detectFaceOrientation(v0, v1, v2, fnorm) == false)
+                            {
+                                Eigen::Vector3d tmpv = v1;
+                                v1 = v2;
+                                v2 = tmpv;
+                            }
+                            break;
+                        }
+                    }
+                    //                std::cout<<"--------------------1----------------------"<<std::endl;
+                    //                std::cout<<V<<std::endl;
+                    //                std::cout<<v0<<std::endl;
+
+                    Eigen::Vector3d  bnorm = boostnormals[fidx];
+                    Eigen::Vector3d  pv0, pv1, pv2;
+                    getProjectTri(v0, v1, v2, pv0, pv1, pv2, bnorm);
+
+                    Eigen::Vector3d  sgrad = getGradientByArea(v0, v1, v2);
+                    Eigen::Vector3d  bgrad = getGradientByArea(pv0, pv1, pv2);
+                    Eigen::Vector3d grad = sgrad - bgrad;
+                    sum_boost_v += grad;
+                }
+                Eigen::Vector3d  b_v = JointTGConfig::get().lambda_hb*500*sum_boost_v;
+                Eigen::Matrix3d  Jboost = Eigen::Matrix3d::Identity();
+
+                H_A = Jboost;
+                H_b = Jboost*b_v;
+//                std::cout<<"-----------1---------------"<<std::endl;
+//                std::cout<<b_v<<std::endl;
+
+
+
+                //Laplacian
+                Eigen::Vector3d  sumV(0.0, 0.0, 0.0);
+                double sum_dist = 0.0;
+                for(int k = 0; k < pts_1r_near[pt_i].size(); k++)
+                {
+                    int pt_idx = pts_1r_near[pt_i][k];
+                    Eigen::Vector3d n_V = mesh.vertices_[pt_idx];
+//                    Eigen::Vector3d  dist_v = V - n_V;
+//                    double dist = std::sqrt(dist_v.dot(dist_v));
+//                    sumV += dist*n_V;
+//                    sum_dist += dist;
+//                    sumV += dist_v;
+                    sumV += n_V;
+
+                }
+
+//                sumV = sumV/sum_dist;
+//                sumV = 0.5*V - 0.5*sumV;
+                sumV = sumV/pts_1r_near[pt_i].size();
+                sumV = V - sumV;
+                Eigen::Matrix3d  Ji = Eigen::Matrix3d::Identity();
+                L_A = Ji;
+                L_b = Ji*sumV;
+
+                //Reg  ：权重100
+                Eigen::Vector3d  tempv = mesh.vertices_[pt_i];
+                Eigen::Matrix3d  J_r = Eigen::Matrix3d::Identity();
+                Eigen::Vector3d  vg = V - tempv;
+                S_A = J_r;
+                S_b = J_r*vg;
+
+//                                std::cout<<"-----------1---------------"<<std::endl;
+//                                std::cout<<b_v<<std::endl;
+//                                std::cout<<"-----------2---------------"<<std::endl;
+//                                std::cout<<vg<<std::endl;
+
+
+                // solve
+                Eigen::MatrixXd  JA(3, 3);
+                Eigen::VectorXd  Jb(3);
+                JA.setZero();
+                Jb.setZero();
+
+
+                //color high weigth
+//                double  c_lab = 1.0f;
+//                double  d_lab = 200.0f;
+//                double  h_lab = 0.0f;
+
+//                double  l_lab = 1000.0f;//10000
+//                double  s_lab = 1000.0f;
+
+
+                //high-boost high weight
+                double  c_lab = JointTGConfig::get().lambda_c;
+                double  d_lab = JointTGConfig::get().lambda_d;
+                double  h_lab = JointTGConfig::get().lambda_H;
+                double  l_lab = JointTGConfig::get().lambda_L;//10000
+                double  s_lab = JointTGConfig::get().lambda_R;
+
+                JA = C_A*c_lab*c_lab + D_A*d_lab*d_lab + H_A*h_lab*h_lab + L_A*l_lab*l_lab + S_A*s_lab*s_lab;
+                Jb = C_b*c_lab + D_b*d_lab + H_b*h_lab + L_b*l_lab + S_b*s_lab;
+
+
+//                JA = H_A*h_lab + S_A*s_lab + L_A*l_lab;
+//                Jb = H_b*h_lab + S_b*s_lab + L_b*l_lab;
+                Eigen::VectorXd result(3);
+//                result = JA.jacobiSvd(Eigen::ComputeThinU | Eigen::ComputeThinV).solve(-Jb);
+                result = -JA.ldlt().solve(Jb);
+                Eigen::VectorXd x_M = result;
+                if(std::isnan(x_M(0)) || std::isnan(x_M(1)) || std::isnan(x_M(2))
+                        || (x_M(0) > 0.5 || x_M(1) > 0.5 || x_M(2) > 0.5))
+                {
+                    std::cout<<"------------nan:"<<std::endl;
+                    x_M(0) = x_M(1) = x_M(2) = 0.0;
+                }
+                pt_offset[pt_i](0) += x_M(0);
+                pt_offset[pt_i](1) += x_M(1);
+                pt_offset[pt_i](2) += x_M(2);
+//                pt_offset[pt_i](0) += b_v(0);
+//                pt_offset[pt_i](1) += b_v(1);
+//                pt_offset[pt_i](2) += b_v(2);
+            }
+            updateMeshBaseOrig(mesh, tempmesh, pt_offset);
+//            mesh.ComputeTriangleNormals();
+    //        computerBoostNormal(mesh, boostnormals, smoothnormals);
+
+
+
+
+            SetProxyIntensityForVertex(mesh, images_gray, camera,
+                                       visiblity_vertex_to_image, proxy_intensity,
+                                       option.image_boundary_margin_);
+        }
+
+//        char buf[256];
+//        sprintf(buf, "HB%02d.ply", iter);
+//        open3d::io::WriteTriangleMesh(buf,mesh);
+
+    }
+
+//    open3d::io::WriteTriangleMesh("nosmooth.ply",mesh);
+
+    //smooth
+//    {
+//        tempmesh.clear();
+//        initmesh(tempmesh, mesh);
+//        HCLaplacianSmooth(tempmesh, pts_1r_near);
+
+//        open3d::color_map::ColorMapOptimizationOption option1;
+//        option1.maximum_iteration_ = 50;
+//        option1.non_rigid_camera_coordinate_ = true;
+//        OptimizeImageCoorRigid(tempmesh, images_gray, images_dx, images_dy, camera,
+//                               visiblity_vertex_to_image,
+//                               visiblity_image_to_vertex, proxy_intensity,
+//                               option1);
+//        open3d::io::WriteTriangleMesh("smooth.ply",tempmesh);
+
+//    }
+
+//    HCLaplacianSmooth(mesh, pts_1r_near);
+    mesh.ComputeTriangleNormals();
+    mesh.ComputeVertexNormals();
+//    open3d::io::WriteTriangleMesh("smooth.ply",mesh);
+
+    //last optimization for texture mapping
+//    option.maximum_iteration_ = 100;
+//    open3d::color_map::ColorMapOptimizationOption option1;
+//    option1.maximum_iteration_ = 50;
+//    option1.non_rigid_camera_coordinate_ = true;
+//    auto warping_uv_ = CreateWarpingFields(images_gray, option1);
+//    auto warping_uv_init_ = CreateWarpingFields(images_gray, option1);
+//    OptimizeImageCoorNonrigid(mesh, images_gray, images_dx, images_dy, warping_uv_,
+//                           warping_uv_init_, camera, visiblity_vertex_to_image,
+//                           visiblity_image_to_vertex, proxy_intensity, option1);
+//    SetGeometryColorAverage(mesh, images_color, warping_uv_, camera,
+//                            visiblity_vertex_to_image,
+//                            option1.image_boundary_margin_);
+
+//    std::cout<<"4-----------------end"<<std::endl;
+
+}
+
+void smoothMesh(geometry::TriangleMesh &mesh)
+{
+    mesh.meshVerticesInfoUpdata();
+    std::vector<std::vector<int> >  adj_1r_faces;
+    compute1RFaces(mesh, adj_1r_faces);
+    std::vector<std::vector<int> >  pts_1r_near, pts_2_3Rnear;//半径r相邻;
+
+    compute1Rnear(mesh, pts_1r_near);//取出每个顶点的1环邻接点
+    compute2_3Rnear(mesh, pts_2_3Rnear);
+
+//    bilateralMeshDenoising(mesh, pts_1r_near);
+    HCLaplacianSmooth(mesh, pts_1r_near);
+}
+
+void meshEnhancement(geometry::TriangleMesh &mesh)
+{
+    mesh.meshVerticesInfoUpdata();
+
+    std::vector<Eigen::Vector3d>  boostnormals;
+    std::vector<Eigen::Vector3d>  smoothnormals;
+    computerBoostNormal(mesh, boostnormals, smoothnormals);
+
+    std::vector<std::vector<int> >  adj_1r_faces;
+    compute1RFaces(mesh, adj_1r_faces);
+//    compute2RFaces(mesh, adj_1r_faces);
+
+    std::vector<Eigen::Vector3d >  pt_offset;
+    initOffset(pt_offset, mesh.vertices_.size());
+
+    std::vector<Eigen::Vector3d >  tempmesh;
+    initmesh(tempmesh, mesh);
+
+    for(int iter =0; iter < 60; iter++)
+    {
+        std::cout<<"------------iter:"<<iter<<std::endl;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+        for(int pt_i = 0; pt_i < mesh.vertices_.size(); pt_i++)
+        {
+            //        if(pt_i %100 != 0)
+            {
+                //            continue;
+            }
+
+            if(mesh.verticesInfo[pt_i] != open3d::geometry::TriangleMesh::VERTEX_CLASS_SIMPLE)
+            {
+                continue;
+            }
+
+            std::vector<int>  adj_faces = adj_1r_faces[pt_i];
+            Eigen::Vector3d  sum_boost_v(0.0f, 0.0f, 0.0f);
+
+            for(int ix = 0; ix < adj_faces.size(); ix++)
+            {
+                int fidx = adj_faces[ix];
+                Eigen::Vector3i  v_ix = mesh.triangles_[fidx];
+                Eigen::Vector3d  v0, v1, v2;
+                for(int v_i = 0; v_i < 3; v_i++)
+                {
+                    if(v_ix(v_i) == pt_i)
+                    {
+                        v0 = mesh.vertices_[v_ix(v_i)];
+                        v1 = mesh.vertices_[v_ix((v_i + 1) % 3)];
+                        v2 = mesh.vertices_[v_ix((v_i + 2) % 3)];
+
+                        Eigen::Vector3d  fnorm = mesh.triangle_normals_[fidx];
+                        //detect face direction
+                        if(detectFaceOrientation(v0, v1, v2, fnorm) == false)
+                        {
+                            Eigen::Vector3d tmpv = v1;
+                            v1 = v2;
+                            v2 = tmpv;
+                        }
+                        break;
+                    }
+                }
+                //                std::cout<<"--------------------1----------------------"<<std::endl;
+                //                std::cout<<V<<std::endl;
+                //                std::cout<<v0<<std::endl;
+
+
+
+                Eigen::Vector3d  bnorm = boostnormals[fidx];
+                Eigen::Vector3d  pv0, pv1, pv2;
+                getProjectTri(v0, v1, v2, pv0, pv1, pv2, bnorm);
+
+
+                Eigen::Vector3d  sgrad = getGradientByArea(v0, v1, v2);
+                Eigen::Vector3d  bgrad = getGradientByArea(pv0, pv1, pv2);
+
+                Eigen::Vector3d  grad = sgrad - bgrad;
+                sum_boost_v += grad;
+
+//                if(pt_i %100 == 0 )
+//                {
+//                    std::cout<<"v0:"<<v0(0)<<" "<<v0(1)<<" "<<v0(2)<<std::endl;
+//                    std::cout<<"v1:"<<v1(0)<<" "<<v1(1)<<" "<<v1(2)<<std::endl;
+//                    std::cout<<"v2:"<<v2(0)<<" "<<v2(1)<<" "<<v2(2)<<std::endl;
+//                    std::cout<<"pv0:"<<pv0(0)<<" "<<pv0(1)<<" "<<pv0(2)<<std::endl;
+//                    std::cout<<"pv1:"<<pv1(0)<<" "<<pv1(1)<<" "<<pv1(2)<<std::endl;
+//                    std::cout<<"pv2:"<<pv2(0)<<" "<<pv2(1)<<" "<<pv2(2)<<std::endl;
+
+//                    //v
+//                    {
+
+//                        {
+//                            Eigen::Vector3d  v01 = v1 - v0;
+//                            Eigen::Vector3d  v02 = v2 - v0;
+//                            v01.normalize(); v02.normalize();
+//                            double cosa = v01.dot(v02);
+
+//                            double arca = std::acos(cosa)*180/3.14;
+//                            std::cout<<"v arca:"<<arca<<std::endl;
+//                        }
+
+//                        double a,b;
+//                        //compute a
+//                        {
+//                            Eigen::Vector3d  v10 = v0 - v1;
+//                            Eigen::Vector3d  v12 = v2 - v1;
+//                            v10.normalize(); v12.normalize();
+//                            double cosa = v10.dot(v12);
+
+
+//                            v10 = v10.cross(v12);
+//                            double sina = std::sqrt(v10.dot(v10));
+//                            a = cosa/sina;
+//                            if(std::isnan(a))
+//                            {
+//                                std::cout<<sina<<std::endl;
+//                            }
+//                            double arca = std::acos(cosa)*180/3.14;
+//                            std::cout<<"---cosa:"<<cosa<<" sina:"<<sina<<"  a:"<<a<<" arca:"<<arca<<std::endl;
+//                        }
+
+//                        //compute b
+//                        {
+//                            Eigen::Vector3d  v20 = v0 - v2;
+//                            Eigen::Vector3d  v21 = v1 - v2;
+//                            v20.normalize();
+//                            v21.normalize();
+//                            double cosb = v20.dot(v21);
+
+//                            v20 = v20.cross(v21);
+//                            double sinb = std::sqrt(v20.dot(v20));
+//                            b = cosb/sinb;
+
+//                            if(std::isnan(b))
+//                            {
+//                                std::cout<<sinb<<std::endl;
+//                            }
+//                            double arcb = std::acos(cosb)*180/3.14;
+
+//                            std::cout<<"---cosb:"<<cosb<<" sinb:"<<sinb<<"  b:"<<b << "arcb:"<<arcb<<std::endl;
+
+//                        }
+////                        Eigen::Vector3d grad = -0.5*((v1 - v0)*a + (v2 - v0)*b);
+//                    }
+
+//                    //pv
+//                    {
+//                        double a,b;
+
+//                        {
+//                            Eigen::Vector3d  v01 = pv1 - v0;
+//                            Eigen::Vector3d  v02 = pv2 - v0;
+//                            v01.normalize(); v02.normalize();
+//                            double cosa = v01.dot(v02);
+
+//                            double arca = std::acos(cosa)*180/3.14;
+//                            std::cout<<"pv arca:"<<arca<<std::endl;
+//                        }
+
+//                        //compute a
+//                        {
+//                            Eigen::Vector3d  v10 = pv0 - pv1;
+//                            Eigen::Vector3d  v12 = pv2 - pv1;
+//                            v10.normalize(); v12.normalize();
+//                            double cosa = v10.dot(v12);
+
+
+//                            v10 = v10.cross(v12);
+//                            double sina = std::sqrt(v10.dot(v10));
+//                            a = cosa/sina;
+//                            if(std::isnan(a))
+//                            {
+//                                std::cout<<sina<<std::endl;
+//                            }
+//                            double arca = std::acos(cosa)*180/3.14;
+
+//                            std::cout<<"pv---cosa:"<<cosa<<" sina:"<<sina<<"  a:"<<a<<" arca:"<<arca<<std::endl;
+//                        }
+
+//                        //compute b
+//                        {
+//                            Eigen::Vector3d  v20 = pv0 - pv2;
+//                            Eigen::Vector3d  v21 = pv1 - pv2;
+//                            v20.normalize();
+//                            v21.normalize();
+//                            double cosb = v20.dot(v21);
+
+//                            v20 = v20.cross(v21);
+//                            double sinb = std::sqrt(v20.dot(v20));
+//                            b = cosb/sinb;
+
+//                            if(std::isnan(b))
+//                            {
+//                                std::cout<<sinb<<std::endl;
+//                            }
+//                            double arcb = std::acos(cosb)*180/3.14;
+
+//                            std::cout<<"pv---cosb:"<<cosb<<" sinb:"<<sinb<<"  b:"<<b<<" arcb:"<<arcb<<std::endl;
+
+//                        }
+////                        Eigen::Vector3d grad = -0.5*((v1 - v0)*a + (v2 - v0)*b);
+//                    }
+//                    std::cout<<"sgrad:"<<sgrad(0)<<" "<<sgrad(1)<<" "<<sgrad(2)<<std::endl;
+//                    std::cout<<"bgrad:"<<bgrad(0)<<" "<<bgrad(1)<<" "<<bgrad(2)<<std::endl;
+//                    std::cout<<pt_i<<"--"<<"grad:"<<grad(0)<<" "<<grad(1)<<" "<<grad(2)<<std::endl;
+//                }
+            }
+            Eigen::Vector3d offset = -0.2*sum_boost_v;
+            pt_offset[pt_i](0) += offset(0);
+            pt_offset[pt_i](1) += offset(1);
+            pt_offset[pt_i](2) += offset(2);
+            if(pt_i %100 == 0 && (offset(0) > 0.1) || offset(1)>0.1 || offset(2) >0.1)
+//            if(pt_i %100 == 0)
+            {
+                std::cout<<pt_i<<"----------------offset:"<<offset(0)<<" "<<offset(1)<<" "<<offset(2)<<std::endl;
+            }
+
+        }
+
+        updateMeshBaseOrig(mesh, tempmesh, pt_offset);
+    }
+
+}
+
+
+
+void ColorAndMeshOptimization(geometry::TriangleMesh &mesh,
+                              const std::vector<std::shared_ptr<geometry::RGBDImage> > &images_rgbd,
+                              camera::PinholeCameraTrajectory &camera)
+{
+    open3d::color_map::ColorMapOptimizationOption option;
+    option.maximum_iteration_ = JointTGConfig::get().TEX_ITER_NUM;
+    option.non_rigid_camera_coordinate_ = false;
+
+    std::cout<<"[ColorAndGeometryOptimization]"<<std::endl;
+    std::vector<std::shared_ptr<geometry::Image>> images_gray, images_dx,images_dy, images_color, images_depth;
+    
+    std::tie(images_gray, images_dx, images_dy, images_color, images_depth) =
+            CreateGradientImages(images_rgbd);
+    
+    std::cout<<"[ColorAndGeometryOptimization] :: MakingMasks"<<std::endl;
+    auto images_mask = CreateDepthBoundaryMasks(images_depth, option);
+    std::cout<<"[ColorAndGeometryOptimization] :: VisibilityCheck"<<std::endl;
+    std::vector<std::vector<int>> visiblity_vertex_to_image;
+    std::vector<std::vector<int>> visiblity_image_to_vertex;
+    std::tie(visiblity_vertex_to_image, visiblity_image_to_vertex) = CreateVertexAndImageVisibility(mesh, images_depth,
+                                                                                                    images_mask, camera, option.maximum_allowable_depth_,
+                                                                                                    option.depth_threshold_for_visiblity_check_);
+    
+    std::vector<double> proxy_intensity;
+
+    open3d::utility::Timer  time;
+    time.Start();
+    OptimizeColorAndMeshIterWithNormalOption(mesh, images_gray, images_color, images_dx, images_dy,
+                                             images_depth, camera,
+                                             visiblity_vertex_to_image, visiblity_image_to_vertex,
+                                             proxy_intensity, option);
+    time.Stop();
+
+}
+
+
+}  // namespace color_map
+}  // namespace open3d

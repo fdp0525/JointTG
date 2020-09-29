@@ -1,0 +1,29 @@
+%YAML:1.0
+depth_fx: 577.871
+depth_fy: 580.258
+depth_cx: 319.623
+depth_cy: 239.624
+depth_width: 640
+depth_height: 480
+
+RGB_fx: 1170.19
+RGB_fy: 1170.19
+RGB_cx: 647.75
+RGB_cy: 483.75
+RGB_width: 1296
+RGB_height: 968
+
+
+external_Iterations: 3
+
+texture_Iterations: 50
+geometry_Iterations: 20
+
+lambda_c: 100
+lambda_d: 1
+
+lambda_H: 10000
+lambda_L: 1000
+lambda_R: 1000
+
+lambda_hb: 0.2
