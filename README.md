@@ -48,4 +48,5 @@ The code has following prerequisites:
 - gcc (5.4.0)
 - OpenCV (2.4.10)
 - Eigen (>3.0)
+- Boost (1.65)
 
